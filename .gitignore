@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+.DS_Store
+
+# Runtime artefacts
+.agent0_cache/
+output/
+probe_run/
+full_delhi_batch/
+final_delhi_batch/

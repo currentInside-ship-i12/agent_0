@@ -1,0 +1,57 @@
+# Agent 0 — Tata Steel GTM Distributor Search Engine
+# Defaults mirror PipelineConfig in src/agent_0/config.py
+# Priority: .env / OS environment (API keys) > this YAML > code defaults.
+# Unknown keys are rejected (extra="forbid") — a typo here fails loudly
+# instead of silently falling back to a code default.
+
+gates:
+  min_turnover_cr: 15.0
+  max_turnover_cr: 300.0
+  max_coarse_distance_km: 180.0
+  min_cannibalization_radius_km: 30.0
+  # Drives the steel-HSN gate. Chapter 72 = iron & steel, 73 = articles of
+  # iron/steel.
+  required_hsn_prefixes: ["72", "73"]
+  # Whitelist of NATURE OF CORE BUSINESS ACTIVITIES codes that qualify a
+  # candidate as a distributor rather than a service provider.
+  allowed_business_activities: ["MFT", "TRD:TWD", "TRD:TRR"]
+
+spatial:
+  # Great-circle distance is multiplied by this to estimate road distance.
+  road_tortuosity_factor: 1.30
+  # Distance at which the logistics sub-score reaches 0.
+  d_target_max_km: 150.0
+
+profit_weights:
+  logistics: 0.45
+  turnover: 0.35
+  processing: 0.20
+
+ease_weights:
+  compliance: 0.40
+  switching: 0.35
+  infrastructure: 0.25
+
+grading:
+  grade_a_min_profit: 75.0
+  grade_a_min_ease: 75.0
+  grade_a_min_confidence: 0.80
+  grade_b_min_profit: 70.0
+  grade_b_min_ease: 50.0
+  grade_c_min_profit: 50.0
+  grade_d_max_profit: 40.0
+  grade_d_max_ease: 40.0
+
+enrichment:
+  top_n_for_enrichment: 50
+  gmaps_refine_top: 5
+  cache_dir: ".agent0_cache"
+  # Max age of a cached Firecrawl payload before it is refetched.
+  # 0 disables expiry. Entries holding no real evidence are always refetched.
+  cache_ttl_days: 30
+
+llm:
+  provider: "anthropic"   # "anthropic" | "openai" | "gemini"
+  model: "claude-sonnet-4-20250514"
+  temperature: 0.0
+  max_tokens: 2000
