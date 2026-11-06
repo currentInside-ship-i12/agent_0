@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,6 +51,12 @@ def _gstin(index: int, state: str = "07") -> str:
     """Build a valid GSTIN-shaped test identifier with a real checksum."""
     prefix = f"{state}ABCDE{index:04d}F1Z"
     return prefix + gstin_check_digit(prefix)
+
+
+def _plain_cli_output(output: str) -> str:
+    """Remove Rich framing before asserting terminal diagnostics."""
+    without_box_drawing = re.sub(r"[\u2500-\u257f]", " ", output)
+    return " ".join(without_box_drawing.split())
 
 
 def _candidate(
@@ -658,7 +665,9 @@ def test_explicit_missing_cli_paths_are_rejected(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 2
-    assert "does not exist" in result.output
+    output = _plain_cli_output(result.output)
+    assert "Invalid value" in output
+    assert "does not exist" in output
 
 
 def test_explicit_missing_existing_network_path_is_rejected(tmp_path: Path) -> None:
@@ -681,7 +690,9 @@ def test_explicit_missing_existing_network_path_is_rejected(tmp_path: Path) -> N
         ],
     )
     assert result.exit_code == 2
-    assert "does not exist" in result.output
+    output = _plain_cli_output(result.output)
+    assert "Invalid value" in output
+    assert "does not exist" in output
 
 
 def test_csv_export_escapes_formulas() -> None:
