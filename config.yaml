@@ -6,7 +6,9 @@
 
 gates:
   min_turnover_cr: 15.0
-  max_turnover_cr: 300.0
+  # Retain all larger distributors. Market-coverage strategy is deliberately
+  # separate from deterministic eligibility.
+  max_turnover_cr: null
   max_coarse_distance_km: 180.0
   min_cannibalization_radius_km: 30.0
   # Drives the steel-HSN gate. Chapter 72 = iron & steel, 73 = articles of
@@ -49,6 +51,11 @@ enrichment:
   # Max age of a cached Firecrawl payload before it is refetched.
   # 0 disables expiry. Entries holding no real evidence are always refetched.
   cache_ttl_days: 30
+  max_workers: 3
+  # Each Firecrawl result is retained separately, so one page cannot crowd
+  # every other source out of the evidence bundle.
+  max_chars_per_source: 3000
+  max_retries: 1
 
 llm:
   provider: "anthropic"   # "anthropic" | "openai" | "gemini"

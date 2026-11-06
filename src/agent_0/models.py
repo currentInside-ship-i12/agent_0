@@ -8,19 +8,19 @@ to maximise determinism across runs.
 from __future__ import annotations
 
 from enum import Enum
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class GeoSource(str, Enum):
     """Where a candidate's coordinates came from."""
 
-    PINCODE = "PINCODE"
-    STATE_CENTROID = "STATE_CENTROID"
-    GMAPS = "GMAPS"
-    NOMINATIM = "NOMINATIM"
     MANUAL = "MANUAL"
+    PIN_EXACT = "PIN_EXACT"
+    PIN_DISTRICT = "PIN_DISTRICT"
+    NOMINATIM = "NOMINATIM"
+    STATE_CENTROID = "STATE_CENTROID"
     NONE = "NONE"
 
 
@@ -32,6 +32,95 @@ class EnrichmentSource(str, Enum):
     NONE = "NONE"
 
 
+class CandidateDisposition(str, Enum):
+    """Deterministic outcome of the pre-filtering stage."""
+
+    ELIGIBLE = "ELIGIBLE"
+    NEEDS_DATA = "NEEDS_DATA"
+    REJECTED = "REJECTED"
+
+
+class RecommendationState(str, Enum):
+    """Commercial queue to which a scored candidate belongs."""
+
+    VERIFIED_RECOMMENDATION = "VERIFIED_RECOMMENDATION"
+    PRIORITIZED_LEAD = "PRIORITIZED_LEAD"
+    REJECTED = "REJECTED"
+
+
+class StrictLLMModel(BaseModel):
+    """Strict contract for model-produced structured data.
+
+    Input records remain permissive enough to normalize messy CSV exports.
+    Model output must not silently coerce booleans or discard unexpected
+    fields, because those values influence commercial recommendations.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class EvidenceCitation(StrictLLMModel):
+    """A model claim tied to an immutable source record."""
+
+    source_id: str = ""
+    quote: str = ""
+
+
+class ToTBranchOutput(StrictLLMModel):
+    """One explicit branch of the single-call Tree of Thoughts analysis."""
+
+    conclusion: str = ""
+    confidence: Literal["STRONG", "MODERATE", "WEAK", "NONE"] = "NONE"
+    citations: List[EvidenceCitation] = Field(default_factory=list)
+    falsification: str = ""
+
+
+class ToTBranches(StrictLLMModel):
+    """Independent perspectives that Stage 2 must reconcile."""
+
+    brand_alignment: ToTBranchOutput = Field(default_factory=ToTBranchOutput)
+    infrastructure: ToTBranchOutput = Field(default_factory=ToTBranchOutput)
+    onboarding_risk: ToTBranchOutput = Field(default_factory=ToTBranchOutput)
+
+
+class Stage2ThinkingOutput(StrictLLMModel):
+    """Adversarial reconciliation of the nested ToT branches."""
+
+    supported_claims: List[str] = Field(default_factory=list)
+    challenged_claims: List[str] = Field(default_factory=list)
+    unresolved_questions: List[str] = Field(default_factory=list)
+    final_rationale: str = ""
+
+
+class EvidenceSource(BaseModel):
+    """A retained web result supplied to the model as untrusted evidence."""
+
+    source_id: str
+    url: str = ""
+    title: str = ""
+    content: str = ""
+
+
+class EnrichmentResult(BaseModel):
+    """Source-preserving result of one enrichment request."""
+
+    source: EnrichmentSource = EnrichmentSource.NONE
+    sources: List[EvidenceSource] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
+class EvidenceValidation(BaseModel):
+    """Deterministic validation of model citations against retained sources."""
+
+    source_count: int = 0
+    cited_source_ids: List[str] = Field(default_factory=list)
+    valid_citation_count: int = 0
+    invalid_citations: List[str] = Field(default_factory=list)
+    branch_citation_counts: dict[str, int] = Field(default_factory=dict)
+    structured_tot_complete: bool = False
+    verified: bool = False
+
+
 # ────────────────────────────────────────────────────────
 # Input Models
 # ────────────────────────────────────────────────────────
@@ -41,8 +130,8 @@ class TataDepot(BaseModel):
     """A Tata Steel plant, mother depot, or consignment agent location."""
 
     name: str
-    latitude: float
-    longitude: float
+    latitude: float = Field(ge=-90.0, le=90.0)
+    longitude: float = Field(ge=-180.0, le=180.0)
 
 
 class DistributorCandidate(BaseModel):
@@ -65,13 +154,14 @@ class DistributorCandidate(BaseModel):
     state_name: str = ""
     permanent_address: Optional[str] = None
     pincode: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
     geocode_source: GeoSource = GeoSource.NONE
 
     # ── Turnover ───────────────────────────────────────
     turnover_slab: Optional[str] = None  # Raw slab string from CSV
-    turnover_midpoint_cr: float = 0.0  # Midpoint of slab in ₹ Crores
+    turnover_midpoint_cr: float = Field(default=0.0, ge=0.0)  # Midpoint of slab in ₹ Crores
+    turnover_known: bool = False
 
     # ── Registration & Compliance ──────────────────────
     registration_status: str = "Unknown"
@@ -111,8 +201,10 @@ class PrefilterResult(BaseModel):
     """Result of the deterministic pre-screening stage."""
 
     candidate: DistributorCandidate
+    disposition: CandidateDisposition = CandidateDisposition.REJECTED
     passed: bool
     rejection_reasons: List[str] = Field(default_factory=list)
+    needs_data_reasons: List[str] = Field(default_factory=list)
     coarse_road_distance_km: Optional[float] = None
     nearest_existing_distributor_km: Optional[float] = None
 
@@ -130,7 +222,7 @@ CONFIDENCE_SCORE_MAP: dict[str, float] = {
 }
 
 
-class S2TVerificationOutput(BaseModel):
+class S2TVerificationOutput(StrictLLMModel):
     """Structured primitives emitted by Claude after ToT + S2T reasoning.
 
     Every field is a strict Literal / bool / List — no free-form
@@ -204,6 +296,14 @@ class S2TVerificationOutput(BaseModel):
         default="",
         description="Adversarial red-team analysis: how this candidate could be a false positive.",
     )
+    tot: ToTBranches = Field(
+        default_factory=ToTBranches,
+        description="Nested ToT branch assessments, each with citation IDs and falsification.",
+    )
+    stage_2: Stage2ThinkingOutput = Field(
+        default_factory=Stage2ThinkingOutput,
+        description="Stage 2 adversarial reconciliation of the three ToT branches.",
+    )
 
     @property
     def confidence_score(self) -> float:
@@ -264,12 +364,14 @@ class FinalEvaluation(BaseModel):
     # Which LLM provider actually served this verification. Differs from the
     # configured provider when a fallback was used.
     verification_provider: Optional[str] = None
+    verification_model: Optional[str] = None
     # VERIFIED = LLM returned evidence beyond NONE; PARTIAL = LLM ran with
     # no real enrichment; UNVERIFIED = no LLM evidence; FAILED = all
     # providers failed.
-    verification_status: Literal[
-        "VERIFIED", "PARTIAL", "UNVERIFIED", "FAILED"
-    ] = "UNVERIFIED"
+    verification_status: Literal["VERIFIED", "PARTIAL", "UNVERIFIED", "FAILED"] = "UNVERIFIED"
+    evidence_validation: EvidenceValidation = Field(default_factory=EvidenceValidation)
+    recommendation_state: RecommendationState = RecommendationState.PRIORITIZED_LEAD
+    action: str = "Field verification required"
 
     # ── Metadata ───────────────────────────────────────
     rejection_reasons: List[str] = Field(default_factory=list)
@@ -277,3 +379,48 @@ class FinalEvaluation(BaseModel):
     permanent_address: Optional[str] = None
     ekyc_status: Optional[str] = None
     aadhaar_verified: Optional[str] = None
+
+
+class CandidateAuditRecord(BaseModel):
+    """Audit record for a candidate that never reaches commercial scoring."""
+
+    candidate: DistributorCandidate
+    disposition: CandidateDisposition
+    reasons: List[str] = Field(default_factory=list)
+    coarse_road_distance_km: Optional[float] = None
+    nearest_existing_distributor_km: Optional[float] = None
+
+
+class RunManifest(BaseModel):
+    """Reproducibility metadata for one pipeline execution."""
+
+    created_at: str
+    depot: TataDepot
+    distributor_csv: str
+    distributor_csv_sha256: str
+    existing_tata_csv: Optional[str] = None
+    existing_tata_csv_sha256: Optional[str] = None
+    code_version: Optional[str] = None
+    config: dict[str, Any] = Field(default_factory=dict)
+    options: dict[str, Any] = Field(default_factory=dict)
+    counts: dict[str, int] = Field(default_factory=dict)
+
+
+class PipelineRunResult(BaseModel):
+    """All queues and reproducibility data produced by one pipeline run."""
+
+    evaluations: List[FinalEvaluation] = Field(default_factory=list)
+    needs_data: List[CandidateAuditRecord] = Field(default_factory=list)
+    rejected: List[CandidateAuditRecord] = Field(default_factory=list)
+    manifest: Optional[RunManifest] = None
+
+    # Preserve iteration over scored evaluations for callers migrating from the
+    # earlier list-returning run_pipeline API.
+    def __iter__(self):
+        return iter(self.evaluations)
+
+    def __len__(self) -> int:
+        return len(self.evaluations)
+
+    def __getitem__(self, index: int) -> FinalEvaluation:
+        return self.evaluations[index]

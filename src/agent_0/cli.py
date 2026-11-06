@@ -1,10 +1,4 @@
-"""Typer CLI for Agent 0 — Tata Steel GTM Distributor Search Engine.
-
-Usage:
-    agent0 run --distributor-csv data.csv --depot-name "Jamshedpur" --depot-lat 22.80 --depot-lon 86.20
-    agent0 run --distributor-csv data.csv --tata-csv existing.csv --config config.yaml --format table
-    agent0 run --distributor-csv data.csv --depot-name "Kalinganagar" --depot-lat 20.93 --depot-lon 86.08 --skip-llm --format csv --output results.csv
-"""
+"""Typer CLI for Agent 0 distributor discovery and evidence queues."""
 
 from __future__ import annotations
 
@@ -12,19 +6,26 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 
 from agent_0.config import load_config
-from agent_0.models import FinalEvaluation, TataDepot
+from agent_0.models import (
+    CandidateAuditRecord,
+    FinalEvaluation,
+    PipelineRunResult,
+    RecommendationState,
+    TataDepot,
+)
 from agent_0.pipeline import run_pipeline
 
 app = typer.Typer(
     name="agent0",
-    help="Agent 0 — Tata Steel GTM Distributor Search & Scoring Engine",
+    help="Agent 0 — Tata Steel GTM distributor discovery and verification",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -32,12 +33,7 @@ console = Console()
 
 
 def _configure_logging(verbose: bool = False) -> None:
-    """Enable module logging.
-
-    Without this, every ``logger.error`` in the pipeline (LLM failures,
-    enrichment errors, cache problems) is silently discarded and the run
-    looks clean while actually having degraded.
-    """
+    """Send diagnostic logs to stderr without corrupting exported artifacts."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
@@ -45,113 +41,211 @@ def _configure_logging(verbose: bool = False) -> None:
     )
 
 
-# ────────────────────────────────────────────────────────
-# Export Helpers
-# ────────────────────────────────────────────────────────
+def _spreadsheet_safe(value: Any) -> Any:
+    """Prevent spreadsheet applications from evaluating source text as formulas."""
+    if not isinstance(value, str):
+        return value
+    if value.lstrip().startswith(("=", "+", "-", "@")):
+        return f"'{value}"
+    return value
+
+
+def _safe_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Build an export dataframe and neutralize spreadsheet formula cells."""
+    dataframe = pd.DataFrame(rows)
+    for column in dataframe.columns:
+        dataframe[column] = dataframe[column].map(_spreadsheet_safe)
+    return dataframe
 
 
 def _evaluations_to_df(evaluations: list[FinalEvaluation]) -> pd.DataFrame:
-    """Flatten evaluations into a pandas DataFrame for CSV/table export."""
-    rows = []
-    for e in evaluations:
+    """Flatten scored outcomes into a spreadsheet-safe dataframe."""
+    rows: list[dict[str, Any]] = []
+    for evaluation in evaluations:
+        verification = evaluation.verification
         row = {
-            "Grade": e.final_grade,
-            "GSTIN": e.gstin,
-            "PAN": e.pan,
-            "Legal Name": e.legal_name,
-            "Trade Name": e.trade_name or "",
-            "State": e.state,
-            "Turnover Slab": e.turnover_slab or "",
-            "Distance (km)": round(e.driving_distance_km, 1),
-            "Distance Source": e.distance_source,
-            "Geocode Source": e.geocode_source,
-            "Profit Score": round(e.scores.profit_score, 2),
-            "Ease Score": round(e.scores.ease_score, 2),
-            "S_Logistics": round(e.scores.s_logistics, 2),
-            "S_Turnover": round(e.scores.s_turnover, 2),
-            "S_Processing": round(e.scores.s_processing, 2),
-            "E_Compliance": round(e.scores.e_compliance, 2),
-            "E_Switching": round(e.scores.e_switching, 2),
-            "E_Infra": round(e.scores.e_infra, 2),
-            "Enrichment Source": e.enrichment_source,
-            "Verification Provider": e.verification_provider or "",
-            "Verification Status": e.verification_status,
-            "Address": e.permanent_address or "",
-            "eKYC Status": e.ekyc_status or "",
-            "Aadhaar Verified": e.aadhaar_verified or "",
+            "Queue": evaluation.recommendation_state.value,
+            "Action": evaluation.action,
+            "Grade": evaluation.final_grade,
+            "GSTIN": evaluation.gstin,
+            "PAN": evaluation.pan,
+            "Legal Name": evaluation.legal_name,
+            "Trade Name": evaluation.trade_name or "",
+            "State": evaluation.state,
+            "Turnover Slab": evaluation.turnover_slab or "",
+            "Distance (km)": round(evaluation.driving_distance_km, 1),
+            "Distance Source": evaluation.distance_source,
+            "Geocode Source": evaluation.geocode_source.value,
+            "Profit Score": round(evaluation.scores.profit_score, 2),
+            "Ease Score": round(evaluation.scores.ease_score, 2),
+            "S_Logistics": round(evaluation.scores.s_logistics, 2),
+            "S_Turnover": round(evaluation.scores.s_turnover, 2),
+            "S_Processing": round(evaluation.scores.s_processing, 2),
+            "E_Compliance": round(evaluation.scores.e_compliance, 2),
+            "E_Switching": round(evaluation.scores.e_switching, 2),
+            "E_Infra": round(evaluation.scores.e_infra, 2),
+            "Enrichment Source": evaluation.enrichment_source.value,
+            "Verification Provider": evaluation.verification_provider or "",
+            "Verification Model": evaluation.verification_model or "",
+            "Verification Status": evaluation.verification_status,
+            "Evidence Sources": evaluation.evidence_validation.source_count,
+            "Valid Citations": evaluation.evidence_validation.valid_citation_count,
+            "Citation Validated": evaluation.evidence_validation.verified,
+            "Citation Errors": " | ".join(evaluation.evidence_validation.invalid_citations),
+            "Address": evaluation.permanent_address or "",
+            "eKYC Status": evaluation.ekyc_status or "",
+            "Aadhaar Verified": evaluation.aadhaar_verified or "",
+            "Rejection Reasons": " | ".join(evaluation.rejection_reasons),
         }
-        if e.verification:
+        if verification:
             row.update(
                 {
-                    "Is Steel Dealer": e.verification.is_primary_steel_dealer,
-                    "Brands Handled": ", ".join(e.verification.brands_currently_handled),
-                    "Switching Feasibility": e.verification.switching_feasibility,
-                    "Has Stockyard": e.verification.has_physical_stockyard,
-                    "Processing": e.verification.processing_capability,
-                    "Litigation Flag": e.verification.promoter_litigation_flag,
-                    "GST Filing": e.verification.gst_filing_regularity,
-                    "Confidence": e.verification.evidence_confidence,
-                    "Verbatim Evidence": e.verification.verbatim_evidence,
-                    "Falsification Notes": e.verification.falsification_notes,
+                    "Is Steel Dealer": verification.is_primary_steel_dealer,
+                    "Brands Handled": ", ".join(verification.brands_currently_handled),
+                    "Exclusive To Competitor": verification.is_exclusive_to_competitor,
+                    "Switching Feasibility": verification.switching_feasibility,
+                    "Has Stockyard": verification.has_physical_stockyard,
+                    "Processing": verification.processing_capability,
+                    "Litigation Flag": verification.promoter_litigation_flag,
+                    "GST Filing": verification.gst_filing_regularity,
+                    "Confidence": verification.evidence_confidence,
+                    "Verbatim Evidence": verification.verbatim_evidence,
+                    "Falsification Notes": verification.falsification_notes,
+                    "ToT Brand Conclusion": verification.tot.brand_alignment.conclusion,
+                    "ToT Infrastructure Conclusion": verification.tot.infrastructure.conclusion,
+                    "ToT Risk Conclusion": verification.tot.onboarding_risk.conclusion,
+                    "Stage 2 Rationale": verification.stage_2.final_rationale,
+                    "Stage 2 Challenges": " | ".join(verification.stage_2.challenged_claims),
+                    "Stage 2 Unresolved Questions": " | ".join(
+                        verification.stage_2.unresolved_questions
+                    ),
                 }
             )
         rows.append(row)
-    return pd.DataFrame(rows)
+    return _safe_dataframe(rows)
 
 
-def _export_csv(evaluations: list[FinalEvaluation], output: Path) -> None:
-    df = _evaluations_to_df(evaluations)
-    df.to_csv(output, index=False, encoding="utf-8-sig")
+def _audit_records_to_df(records: list[CandidateAuditRecord]) -> pd.DataFrame:
+    """Flatten Needs Data and deterministic-rejection records for export."""
+    rows = [
+        {
+            "Queue": record.disposition.value,
+            "GSTIN": record.candidate.gstin,
+            "PAN": record.candidate.pan,
+            "Legal Name": record.candidate.legal_name,
+            "Trade Name": record.candidate.trade_name or "",
+            "State": record.candidate.state_name,
+            "Turnover Slab": record.candidate.turnover_slab or "",
+            "Turnover Known": record.candidate.turnover_known,
+            "Geocode Source": record.candidate.geocode_source.value,
+            "Address": record.candidate.permanent_address or "",
+            "Coarse Distance (km)": record.coarse_road_distance_km,
+            "Nearest Existing Distributor (km)": record.nearest_existing_distributor_km,
+            "Reasons": " | ".join(record.reasons),
+        }
+        for record in records
+    ]
+    return _safe_dataframe(rows)
+
+
+def _export_csv(dataframe: pd.DataFrame, output: Path) -> None:
+    dataframe.to_csv(output, index=False, encoding="utf-8-sig")
     console.print(f"[green]CSV exported to:[/] {output}")
 
 
-def _export_json(evaluations: list[FinalEvaluation], output: Path) -> None:
-    data = [e.model_dump(mode="json") for e in evaluations]
-    with open(output, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+def _export_json(data: Any, output: Path) -> None:
+    if isinstance(data, list):
+        payload = [
+            item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in data
+        ]
+    elif hasattr(data, "model_dump"):
+        payload = data.model_dump(mode="json")
+    else:
+        payload = data
+    with output.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, ensure_ascii=False)
     console.print(f"[green]JSON exported to:[/] {output}")
 
 
 def _export_table(evaluations: list[FinalEvaluation]) -> None:
+    """Print scored rows; audit queues are written to structured artifacts."""
     from rich.table import Table
 
-    table = Table(title="Agent 0 — Full Results", show_lines=True)
+    table = Table(title="Agent 0 — Scored Candidates", show_lines=True)
     table.add_column("#", width=3)
+    table.add_column("Queue", max_width=24)
     table.add_column("Grade", width=5)
     table.add_column("Name", max_width=28)
     table.add_column("GSTIN", width=16)
-    table.add_column("State", width=14)
-    table.add_column("Turnover", width=12)
-    table.add_column("Dist", justify="right", width=7)
     table.add_column("Profit", justify="right", width=7)
-    table.add_column("Ease", justify="right", width=7)
-    table.add_column("Conf", width=8)
+    table.add_column("Evidence", justify="right", width=8)
 
-    grade_colors = {"A": "green", "B": "yellow", "C": "blue", "D": "red"}
-
-    for i, e in enumerate(evaluations, 1):
-        color = grade_colors.get(e.final_grade, "white")
-        conf = e.verification.evidence_confidence if e.verification else "N/A"
-        name = (e.trade_name or e.legal_name)[:28]
+    for index, evaluation in enumerate(evaluations, start=1):
         table.add_row(
-            str(i),
-            f"[{color}]{e.final_grade}[/]",
-            name,
-            e.gstin,
-            e.state,
-            e.turnover_slab or "N/A",
-            f"{e.driving_distance_km:.0f}",
-            f"{e.scores.profit_score:.1f}",
-            f"{e.scores.ease_score:.1f}",
-            str(conf),
+            str(index),
+            evaluation.recommendation_state.value,
+            evaluation.final_grade,
+            (evaluation.trade_name or evaluation.legal_name)[:28],
+            evaluation.gstin,
+            f"{evaluation.scores.profit_score:.1f}",
+            str(evaluation.evidence_validation.valid_citation_count),
         )
-
     console.print(table)
 
 
-# ────────────────────────────────────────────────────────
-# CLI Commands
-# ────────────────────────────────────────────────────────
+def _export_run(result: PipelineRunResult, output_dir: Path, fmt: str) -> None:
+    """Write every commercial queue and the reproducibility manifest."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    verified = [
+        evaluation
+        for evaluation in result.evaluations
+        if evaluation.recommendation_state == RecommendationState.VERIFIED_RECOMMENDATION
+    ]
+    prioritized_leads = [
+        evaluation
+        for evaluation in result.evaluations
+        if evaluation.recommendation_state == RecommendationState.PRIORITIZED_LEAD
+    ]
+    post_verification_rejections = [
+        evaluation
+        for evaluation in result.evaluations
+        if evaluation.recommendation_state == RecommendationState.REJECTED
+    ]
+
+    if fmt in ("csv", "all"):
+        _export_csv(_evaluations_to_df(result.evaluations), output_dir / "agent0_results.csv")
+        _export_csv(
+            _evaluations_to_df(verified),
+            output_dir / "agent0_verified_recommendations.csv",
+        )
+        _export_csv(
+            _evaluations_to_df(prioritized_leads),
+            output_dir / "agent0_prioritized_leads.csv",
+        )
+        _export_csv(_audit_records_to_df(result.needs_data), output_dir / "agent0_needs_data.csv")
+        _export_csv(
+            _audit_records_to_df(result.rejected),
+            output_dir / "agent0_prefilter_rejected.csv",
+        )
+        _export_csv(
+            _evaluations_to_df(post_verification_rejections),
+            output_dir / "agent0_post_verification_rejected.csv",
+        )
+
+    if fmt in ("json", "all"):
+        _export_json(result.evaluations, output_dir / "agent0_results.json")
+        _export_json(verified, output_dir / "agent0_verified_recommendations.json")
+        _export_json(prioritized_leads, output_dir / "agent0_prioritized_leads.json")
+        _export_json(result.needs_data, output_dir / "agent0_needs_data.json")
+        _export_json(result.rejected, output_dir / "agent0_prefilter_rejected.json")
+        _export_json(
+            post_verification_rejections,
+            output_dir / "agent0_post_verification_rejected.json",
+        )
+        _export_json(result.manifest, output_dir / "agent0_run_manifest.json")
+
+    if fmt in ("table", "all"):
+        _export_table(result.evaluations)
 
 
 @app.command()
@@ -160,41 +254,39 @@ def run(
         ...,
         "--distributor-csv",
         "-d",
-        help="Path to distributor CSV file (Clear GST format).",
+        help="Path to distributor CSV file.",
         exists=True,
         readable=True,
+        dir_okay=False,
     ),
-    depot_name: str = typer.Option(
-        ...,
-        "--depot-name",
-        help="Name of the target Tata Steel depot/plant.",
-    ),
-    depot_lat: float = typer.Option(
-        ...,
-        "--depot-lat",
-        help="Latitude of the target depot.",
-    ),
-    depot_lon: float = typer.Option(
-        ...,
-        "--depot-lon",
-        help="Longitude of the target depot.",
-    ),
+    depot_name: str = typer.Option(..., "--depot-name", help="Target Tata Steel depot/plant."),
+    depot_lat: float = typer.Option(..., "--depot-lat", help="Depot latitude."),
+    depot_lon: float = typer.Option(..., "--depot-lon", help="Depot longitude."),
     tata_csv: Optional[Path] = typer.Option(
         None,
         "--tata-csv",
         "-t",
-        help="Optional CSV of existing Tata distributors (same format).",
+        help="Existing Tata distributor CSV used for anti-cannibalization.",
+        exists=True,
+        readable=True,
+        dir_okay=False,
     ),
     config_file: Optional[Path] = typer.Option(
         None,
         "--config",
         "-c",
-        help="Path to config.yaml. Defaults to ./config.yaml.",
+        help="Configuration YAML. Defaults to ./config.yaml when present.",
+        exists=True,
+        readable=True,
+        dir_okay=False,
     ),
     env_file: Optional[Path] = typer.Option(
         None,
         "--env",
-        help="Path to .env file. Defaults to ./.env.",
+        help="Environment file. Defaults to ./.env when present.",
+        exists=True,
+        readable=True,
+        dir_okay=False,
     ),
     output_format: str = typer.Option(
         "all",
@@ -206,138 +298,111 @@ def run(
         None,
         "--output",
         "-o",
-        help="Output directory for csv/json files. Defaults to ./output/.",
+        help="Directory for queue and manifest artifacts. Defaults to ./output/.",
     ),
-    skip_enrichment: bool = typer.Option(
+    skip_enrichment: bool = typer.Option(False, "--skip-enrichment"),
+    skip_llm: bool = typer.Option(False, "--skip-llm"),
+    offline: bool = typer.Option(
         False,
-        "--skip-enrichment",
-        help="Skip Firecrawl web enrichment.",
-    ),
-    skip_llm: bool = typer.Option(
-        False,
-        "--skip-llm",
-        help="Skip Claude/OpenAI ToT+S2T verification (use safe defaults).",
+        "--offline",
+        help="Disable every network integration: Firecrawl, LLMs, Nominatim, and Maps.",
     ),
     use_nominatim: bool = typer.Option(
         False,
         "--nominatim",
-        help="Use Nominatim API for geocoding (slow, 1 req/sec).",
+        help="Use Nominatim address/PIN lookup for unresolved locations.",
     ),
     max_distance: Optional[float] = typer.Option(
         None,
         "--max-distance",
-        help="Override max coarse distance gate (km).",
+        help="Override trusted-location coarse-distance gate in km.",
     ),
     top_n: Optional[int] = typer.Option(
         None,
         "--top-n",
-        help="Override number of candidates to enrich via Firecrawl+LLM.",
+        help="Override number of eligible candidates to enrich.",
     ),
     gmaps_top: Optional[int] = typer.Option(
         None,
         "--gmaps-top",
-        help="Limit GMaps refinement to the N closest candidates (0 disables).",
+        help="Limit Google Maps refinement to N eligible candidates; 0 disables.",
     ),
     llm_provider: Optional[str] = typer.Option(
         None,
         "--llm",
-        help="LLM provider override: 'anthropic', 'openai', or 'gemini'.",
+        help="LLM provider override: anthropic, openai, or gemini.",
     ),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="Emit detailed diagnostics (LLM failures, enrichment errors) to stderr.",
-    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Run the full Agent 0 pipeline: Search → Filter → Enrich → Score → Grade."""
-
+    """Run discovery → evidence → nested ToT/S2T → commercial queue export."""
     _configure_logging(verbose=verbose)
-
-    # Validate the output format BEFORE running the pipeline: an invalid
-    # format must not cost a full run of enrichment + LLM calls.
     fmt = output_format.lower()
     if fmt not in ("csv", "json", "table", "all"):
         console.print(
-            f"[red]Unknown --format '{output_format}'. "
-            "Expected one of: csv, json, table, all.[/]"
+            f"[red]Unknown --format '{output_format}'. Expected csv, json, table, or all.[/]"
         )
         raise typer.Exit(2)
 
-    console.print()
-    console.print(
-        "[bold magenta]╔══════════════════════════════════════════════╗[/]"
-    )
-    console.print(
-        "[bold magenta]║   Agent 0 — Tata Steel GTM Search Engine    ║[/]"
-    )
-    console.print(
-        "[bold magenta]╚══════════════════════════════════════════════╝[/]"
-    )
-    console.print()
-
-    # ── Load config ────────────────────────────────────
     cfg_path = config_file or Path("config.yaml")
-    env_path_resolved = env_file or Path(".env")
-    config = load_config(
-        config_path=cfg_path if cfg_path.exists() else None,
-        env_path=env_path_resolved if env_path_resolved.exists() else None,
-    )
+    env_path = env_file or Path(".env")
+    try:
+        config = load_config(
+            config_path=cfg_path if cfg_path.exists() else None,
+            env_path=env_path if env_path.exists() else None,
+        )
+        if max_distance is not None:
+            config.gates.max_coarse_distance_km = max_distance
+        if top_n is not None:
+            config.enrichment.top_n_for_enrichment = top_n
+        if gmaps_top is not None:
+            config.enrichment.gmaps_refine_top = gmaps_top
+        if llm_provider:
+            config.llm.provider = llm_provider.lower()
+    except (ValidationError, ValueError) as exc:
+        console.print(f"[red]Invalid configuration: {exc}[/]")
+        raise typer.Exit(2) from exc
 
-    # Apply CLI overrides
-    if max_distance is not None:
-        config.gates.max_coarse_distance_km = max_distance
-    if top_n is not None:
-        config.enrichment.top_n_for_enrichment = top_n
-    if gmaps_top is not None:
-        config.enrichment.gmaps_refine_top = gmaps_top
-    if llm_provider:
-        config.llm.provider = llm_provider
-
-    # Validate API keys
     if (
-        not skip_llm
+        not offline
+        and not skip_llm
         and not config.anthropic_api_key
         and not config.openai_api_key
         and not config.gemini_api_key
     ):
         console.print(
-            "[red]No LLM API key found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY "
-            "in .env, or use --skip-llm.[/]"
+            "[red]No LLM API key found. Set an API key, use --skip-llm, or use --offline.[/]"
         )
         raise typer.Exit(1)
 
-    if config.llm.provider == "anthropic" and not config.anthropic_api_key:
+    # Preserve the approved existing fallback behavior when the configured
+    # primary key is absent. Runtime provider failures still fall through in
+    # run_tot_s2t.
+    if not offline and config.llm.provider == "anthropic" and not config.anthropic_api_key:
         if config.openai_api_key:
-            console.print(
-                "[yellow]Anthropic key not found. Falling back to OpenAI.[/]"
-            )
+            console.print("[yellow]Anthropic key not found. Falling back to OpenAI.[/]")
             config.llm.provider = "openai"
         elif config.gemini_api_key:
-            console.print(
-                "[yellow]Anthropic key not found. Falling back to Gemini.[/]"
-            )
+            console.print("[yellow]Anthropic key not found. Falling back to Gemini.[/]")
             config.llm.provider = "gemini"
-        elif not skip_llm:
-            console.print("[red]ANTHROPIC_API_KEY not set. Use --skip-llm or provide the key.[/]")
-            raise typer.Exit(1)
 
-    # ── Build depot ────────────────────────────────────
-    if skip_llm:
-        console.print(
-            "[yellow]Warning: --skip-llm passed. LLM verification is skipped, "
-            "so evidence confidence defaults to NONE (0.10) and "
-            "Grades A/B are unreachable without LLM verification (capped at C).[/]"
-        )
-    depot = TataDepot(name=depot_name, latitude=depot_lat, longitude=depot_lon)
-    console.print(f"  Target Depot: [bold]{depot.name}[/] ({depot.latitude}, {depot.longitude})")
-    console.print(f"  Config: {cfg_path}")
-    console.print(f"  LLM: {config.llm.provider}/{config.llm.model}")
-    console.print(f"  Enrichment: {'Enabled' if not skip_enrichment and config.firecrawl_api_key else 'Disabled'}")
+    try:
+        depot = TataDepot(name=depot_name, latitude=depot_lat, longitude=depot_lon)
+    except ValidationError as exc:
+        console.print(f"[red]Invalid depot coordinates: {exc}[/]")
+        raise typer.Exit(2) from exc
     console.print()
+    console.print("[bold magenta]Agent 0 — Tata Steel distributor discovery[/]")
+    console.print(f"  Target Depot: [bold]{depot.name}[/] ({depot.latitude}, {depot.longitude})")
+    console.print(
+        f"  Mode: {'Offline (no network)' if offline else 'Connected'} | "
+        f"LLM: {config.llm.provider}/{config.llm.model}"
+    )
+    if offline:
+        console.print(
+            "[yellow]  Offline mode disables Firecrawl, LLMs, Nominatim, and Google Maps.[/]"
+        )
 
-    # ── Run pipeline ───────────────────────────────────
-    evaluations = run_pipeline(
+    result = run_pipeline(
         distributor_csv=distributor_csv,
         tata_depot=depot,
         config=config,
@@ -345,49 +410,49 @@ def run(
         skip_enrichment=skip_enrichment,
         skip_llm=skip_llm,
         use_nominatim=use_nominatim,
+        offline=offline,
     )
-
-    if not evaluations:
-        console.print("[red]No results produced.[/]")
-        raise typer.Exit(1)
-
-    # ── Export results ─────────────────────────────────
     out_dir = output_dir or Path("output")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    _export_run(result, out_dir, fmt)
 
-    if fmt in ("csv", "all"):
-        _export_csv(evaluations, out_dir / "agent0_results.csv")
-    if fmt in ("json", "all"):
-        _export_json(evaluations, out_dir / "agent0_results.json")
-    if fmt in ("table", "all"):
-        _export_table(evaluations)
+    if not result.evaluations and not result.needs_data and not result.rejected:
+        console.print("[red]No valid candidate rows were produced from the input CSV.[/]")
+        raise typer.Exit(1)
 
 
 @app.command()
 def info() -> None:
-    """Show Agent 0 configuration and system info."""
+    """Show effective local configuration without displaying secret values."""
     _configure_logging()
-    # Resolve config.yaml relative to the CWD, exactly like `run` does,
-    # so the reported thresholds match what a pipeline run would use.
     cfg_path = Path("config.yaml")
-    config = load_config(config_path=cfg_path if cfg_path.exists() else None)
+    try:
+        config = load_config(config_path=cfg_path if cfg_path.exists() else None)
+    except (ValidationError, ValueError) as exc:
+        console.print(f"[red]Invalid configuration: {exc}[/]")
+        raise typer.Exit(2) from exc
+
     console.print("[bold]Agent 0 Configuration:[/]")
-    console.print(f"  Config File: {cfg_path if cfg_path.exists() else 'defaults only (no config.yaml found)'}")
+    console.print(
+        f"  Config File: {cfg_path if cfg_path.exists() else 'defaults only (no config.yaml found)'}"
+    )
     console.print(f"  LLM Provider: {config.llm.provider}")
     console.print(f"  LLM Model: {config.llm.model}")
     console.print(f"  Anthropic Key: {'✓ Set' if config.anthropic_api_key else '✗ Missing'}")
-    console.print(f"  Anthropic Workspace: {'✓ Set' if config.anthropic_workspace_id else '— Unset (only needed for unscoped enterprise keys)'}")
     console.print(f"  OpenAI Key: {'✓ Set' if config.openai_api_key else '✗ Missing'}")
     console.print(f"  Gemini Key: {'✓ Set' if config.gemini_api_key else '✗ Missing'}")
     console.print(f"  Firecrawl Key: {'✓ Set' if config.firecrawl_api_key else '✗ Missing'}")
     console.print(f"  Google Maps Key: {'✓ Set' if config.gmaps_api_key else '✗ Missing'}")
     console.print()
-    console.print("[bold]Gate Thresholds:[/]")
-    console.print(f"  Turnover Range: ₹{config.gates.min_turnover_cr}–{config.gates.max_turnover_cr} Cr")
-    console.print(f"  Max Distance: {config.gates.max_coarse_distance_km} km")
+    console.print("[bold]Eligibility:[/]")
+    console.print(f"  Minimum Turnover: ₹{config.gates.min_turnover_cr} Cr")
+    console.print(
+        f"  Maximum Turnover: "
+        f"{'None (all sizes retained)' if config.gates.max_turnover_cr is None else config.gates.max_turnover_cr}"
+    )
+    console.print(f"  Max Trusted-Location Distance: {config.gates.max_coarse_distance_km} km")
     console.print(f"  Anti-Cannibalization Radius: {config.gates.min_cannibalization_radius_km} km")
-    console.print(f"  HSN Prefixes: {config.gates.required_hsn_prefixes}")
     console.print(f"  Top-N for Enrichment: {config.enrichment.top_n_for_enrichment}")
+    console.print("  Offline Mode: --offline disables all network integrations")
 
 
 if __name__ == "__main__":

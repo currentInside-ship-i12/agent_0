@@ -25,10 +25,9 @@ console = Console()
 # ────────────────────────────────────────────────────────
 # Offline PIN-code coordinate table (no network required)
 #
-# Exact 6-digit hits are preferred; otherwise the first 3 digits
-# (postal sorting district) give an approximate location. This runs
-# BEFORE the use_nominatim gate so extracted pincodes resolve to
-# GeoSource.PINCODE instead of falling back to STATE_CENTROID.
+# Exact 6-digit hits are preferred. A first-3-digit postal sorting district is
+# retained as an explicitly lower-quality fallback, never disguised as an
+# exact PIN location.
 # ────────────────────────────────────────────────────────
 
 OFFLINE_PINCODE_COORDS: dict[str, tuple[float, float]] = {
@@ -71,16 +70,25 @@ PIN_PREFIX_3_COORDS: dict[str, tuple[float, float]] = {
 }
 
 
-def lookup_offline_pincode(pincode: str | None) -> tuple[float, float] | None:
-    """Resolve a pincode offline via exact then 3-digit prefix tables."""
+def lookup_offline_pincode_resolution(
+    pincode: str | None,
+) -> tuple[tuple[float, float], GeoSource] | None:
+    """Resolve a PIN while preserving exact-versus-district provenance."""
     if not pincode:
         return None
     clean = pincode.strip()
     if clean in OFFLINE_PINCODE_COORDS:
-        return OFFLINE_PINCODE_COORDS[clean]
+        return OFFLINE_PINCODE_COORDS[clean], GeoSource.PIN_EXACT
     if len(clean) >= 3 and clean[:3] in PIN_PREFIX_3_COORDS:
-        return PIN_PREFIX_3_COORDS[clean[:3]]
+        return PIN_PREFIX_3_COORDS[clean[:3]], GeoSource.PIN_DISTRICT
     return None
+
+
+def lookup_offline_pincode(pincode: str | None) -> tuple[float, float] | None:
+    """Resolve a pincode offline via exact then 3-digit prefix tables."""
+    resolution = lookup_offline_pincode_resolution(pincode)
+    return resolution[0] if resolution else None
+
 
 # ────────────────────────────────────────────────────────
 # GSTIN 2-digit State Code to Geographic Centroid Table
@@ -167,61 +175,81 @@ def _save_pincode_cache(
 # ────────────────────────────────────────────────────────
 
 
+def _geocode_nominatim(
+    params: dict[str, str],
+    cache_key: str,
+    cache: dict[str, list[float]],
+    cache_file: Path,
+) -> Optional[tuple[float, float]]:
+    """Resolve a Nominatim query with a cache and the service's one-request/sec limit."""
+    if cache_key in cache:
+        coords = cache[cache_key]
+        if coords and len(coords) == 2:
+            return coords[0], coords[1]
+        return None
+
+    headers = {"User-Agent": "Agent0-TataSteelDistributorPipeline/1.0"}
+    request_params = {"format": "json", "limit": "1", **params}
+
+    try:
+        time.sleep(1.0)
+        response = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params=request_params,
+            headers=headers,
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data and isinstance(data, list):
+            lat = float(data[0]["lat"])
+            lon = float(data[0]["lon"])
+            cache[cache_key] = [lat, lon]
+            _save_pincode_cache(cache, cache_file)
+            return lat, lon
+
+        cache[cache_key] = []
+        _save_pincode_cache(cache, cache_file)
+    except Exception as exc:
+        logger.warning("Nominatim geocoding failed for %s: %s", cache_key, exc)
+
+    return None
+
+
 def geocode_pincode_nominatim(
     pincode: str,
     cache: dict[str, list[float]],
     cache_file: Path = PINCODE_CACHE_FILE,
 ) -> Optional[tuple[float, float]]:
-    """Lookup latitude/longitude for an Indian 6-digit PIN code via Nominatim.
-
-    Uses caching to avoid repeated network calls. Applies a strict 1-second
-    rate-limit between live API requests per OSM acceptable use policy.
-
-    Args:
-        pincode: 6-digit Indian postal code.
-        cache: In-memory cache mapping pincode strings to [lat, lon].
-        cache_file: Path to persistent cache JSON file.
-
-    Returns:
-        Tuple of (latitude, longitude) if resolved, else None.
-    """
+    """Lookup latitude/longitude for an Indian PIN code via Nominatim."""
     clean_pincode = pincode.strip()
     if not clean_pincode:
         return None
-
-    # Check cache first
-    if clean_pincode in cache:
-        coords = cache[clean_pincode]
-        if coords and len(coords) == 2:
-            return coords[0], coords[1]
-        return None
-
-    url = (
-        f"https://nominatim.openstreetmap.org/search?"
-        f"postalcode={clean_pincode}&country=India&format=json"
+    return _geocode_nominatim(
+        {"postalcode": clean_pincode, "country": "India"},
+        f"pincode:{clean_pincode}",
+        cache,
+        cache_file,
     )
-    headers = {"User-Agent": "Agent0-TataSteelDistributorPipeline/1.0"}
 
-    try:
-        time.sleep(1.0)  # Nominatim strict rate-limit requirement: 1 request/sec
-        resp = requests.get(url, headers=headers, timeout=10.0)
-        resp.raise_for_status()
-        data = resp.json()
 
-        if data and isinstance(data, list) and len(data) > 0:
-            lat = float(data[0]["lat"])
-            lon = float(data[0]["lon"])
-            cache[clean_pincode] = [lat, lon]
-            _save_pincode_cache(cache, cache_file)
-            return lat, lon
-
-        # Cache misses as empty list to prevent repeated 404/empty queries
-        cache[clean_pincode] = []
-        _save_pincode_cache(cache, cache_file)
-    except Exception as e:
-        logger.warning("Nominatim geocoding failed for pincode %s: %s", clean_pincode, e)
-
-    return None
+def geocode_address_nominatim(
+    address: str,
+    cache: dict[str, list[float]],
+    cache_file: Path = PINCODE_CACHE_FILE,
+) -> Optional[tuple[float, float]]:
+    """Lookup a full registered address when a precise PIN lookup is unavailable."""
+    clean_address = address.strip()
+    if not clean_address:
+        return None
+    cache_key = f"address:{clean_address.lower()}"
+    return _geocode_nominatim(
+        {"q": f"{clean_address}, India"},
+        cache_key,
+        cache,
+        cache_file,
+    )
 
 
 # ────────────────────────────────────────────────────────
@@ -238,11 +266,11 @@ def geocode_candidates(
 
     Resolution hierarchy:
       1. Pre-existing coordinates -> geocode_source = GeoSource.MANUAL (retained).
-      2. Offline pincode table (exact 6-digit, then 3-digit prefix)
-         -> geocode_source = GeoSource.PINCODE (no network required).
-      3. If pincode is available and use_nominatim=True -> geocoded via Nominatim/cache.
-      4. Fallback to state centroid matching candidate.state_code.
-      5. If unknown state code, remains geocode_source = GeoSource.NONE.
+      2. Offline exact 6-digit PIN lookup -> GeoSource.PIN_EXACT.
+      3. If enabled, Nominatim full-address/PIN lookup -> GeoSource.NOMINATIM.
+      4. Offline 3-digit PIN district lookup -> GeoSource.PIN_DISTRICT.
+      5. Fallback to state centroid matching candidate.state_code.
+      6. If unknown state code, remains geocode_source = GeoSource.NONE.
 
     Args:
         candidates: List of DistributorCandidate models to geocode in-place.
@@ -256,7 +284,8 @@ def geocode_candidates(
     pincode_cache = _load_pincode_cache(cache_file) if use_nominatim else {}
     source_counts: dict[str, int] = {
         "MANUAL": 0,
-        "PINCODE": 0,
+        "PIN_EXACT": 0,
+        "PIN_DISTRICT": 0,
         "NOMINATIM": 0,
         "STATE_CENTROID": 0,
         "NONE": 0,
@@ -271,25 +300,52 @@ def geocode_candidates(
 
         resolved = False
 
-        # Step b: Offline pincode lookup (exact, then 3-digit prefix) — no network.
+        # Step b: exact offline PIN lookup. A district anchor is intentionally
+        # deferred until after the optional full-address web geocoder.
         if cand.pincode:
-            offline_coords = lookup_offline_pincode(cand.pincode)
-            if offline_coords:
-                cand.latitude, cand.longitude = offline_coords
-                cand.geocode_source = GeoSource.PINCODE
-                source_counts["PINCODE"] += 1
+            offline_resolution = lookup_offline_pincode_resolution(cand.pincode)
+            if offline_resolution and offline_resolution[1] == GeoSource.PIN_EXACT:
+                cand.latitude, cand.longitude = offline_resolution[0]
+                cand.geocode_source = GeoSource.PIN_EXACT
+                source_counts["PIN_EXACT"] += 1
                 resolved = True
 
-        # Step c: Try PIN code geocoding via Nominatim if requested and still unresolved
-        if not resolved and use_nominatim and cand.pincode:
-            coords = geocode_pincode_nominatim(cand.pincode, pincode_cache, cache_file)
+        # Step c: optional web geocoding. The full registered address is more
+        # discriminating than a district anchor, so it is preferred over a
+        # 3-digit offline prefix when the user enables Nominatim.
+        if not resolved and use_nominatim:
+            coords = None
+            if cand.permanent_address:
+                coords = geocode_address_nominatim(
+                    cand.permanent_address,
+                    pincode_cache,
+                    cache_file,
+                )
+            if coords is None and cand.pincode:
+                coords = geocode_pincode_nominatim(
+                    cand.pincode,
+                    pincode_cache,
+                    cache_file,
+                )
             if coords:
                 cand.latitude, cand.longitude = coords
                 cand.geocode_source = GeoSource.NOMINATIM
                 source_counts["NOMINATIM"] += 1
                 resolved = True
 
-        # Step d: Fallback to state centroid from GSTIN_STATE_CENTROIDS
+        # Step d: district-level offline PIN anchor. This is useful for lead
+        # discovery but must not drive hard spatial gates downstream.
+        if not resolved and cand.pincode:
+            offline_resolution = lookup_offline_pincode_resolution(cand.pincode)
+            if offline_resolution and offline_resolution[1] == GeoSource.PIN_DISTRICT:
+                cand.latitude, cand.longitude = offline_resolution[0]
+                cand.geocode_source = GeoSource.PIN_DISTRICT
+                source_counts["PIN_DISTRICT"] += 1
+                resolved = True
+
+        # Step e: fallback to a state centroid only for a visibly unresolved
+        # lead. Downstream policy routes it to Needs Data rather than applying
+        # spatial eligibility gates.
         if not resolved:
             state_code = cand.state_code.zfill(2) if cand.state_code else ""
             if state_code in GSTIN_STATE_CENTROIDS:
@@ -307,9 +363,7 @@ def geocode_candidates(
     table.add_column("Geocode Source", style="cyan", no_wrap=True)
     table.add_column("Count", style="magenta")
 
-    total_geocoded = sum(
-        count for src, count in source_counts.items() if src != "NONE"
-    )
+    total_geocoded = sum(count for src, count in source_counts.items() if src != "NONE")
 
     for src, count in source_counts.items():
         table.add_row(src, str(count))

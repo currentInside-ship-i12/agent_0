@@ -2,7 +2,7 @@
 
 Loads raw distributor GST export CSVs, parses turnover slabs, normalizes
 HSN/SAC product codes, extracts geolocation hints (state, pincode), and
-performs PAN-level deduplication.
+preserves individual GST registrations for depot-specific analysis.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import pandas as pd
 from rich.console import Console
 from rich.table import Table
 
-from agent_0.models import DistributorCandidate
+from agent_0.models import DistributorCandidate, GeoSource
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -68,6 +68,9 @@ GSTIN_STATE_MAP: dict[str, str] = {
 }
 
 PINCODE_REGEX = re.compile(r"\b([1-9]\d{5})\b")
+GSTIN_REGEX = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$")
+GSTIN_CHARACTERS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+GSTIN_CHARACTER_VALUES = {character: index for index, character in enumerate(GSTIN_CHARACTERS)}
 
 
 # ────────────────────────────────────────────────────────
@@ -96,7 +99,44 @@ def _col(row: pd.Series, *names: str) -> Any:
     for name in names:
         if name in index:
             return row.get(name)
+    normalized_headers = {str(header).strip().upper(): header for header in index}
+    for name in names:
+        header = normalized_headers.get(name.strip().upper())
+        if header is not None:
+            return row.get(header)
     return None
+
+
+def gstin_check_digit(prefix: str) -> str:
+    """Return the GSTIN Mod-36 check digit for a validated 14-character prefix."""
+    total = 0
+    factor = 1
+    for character in prefix:
+        value = GSTIN_CHARACTER_VALUES[character]
+        addend = factor * value
+        total += (addend // 36) + (addend % 36)
+        factor = 2 if factor == 1 else 1
+    return GSTIN_CHARACTERS[(36 - total % 36) % 36]
+
+
+def is_valid_gstin(gstin: str | None) -> bool:
+    """Validate GSTIN format and Mod-36 checksum before using it as an identifier."""
+    clean = (gstin or "").strip().upper()
+    return bool(GSTIN_REGEX.fullmatch(clean) and gstin_check_digit(clean[:14]) == clean[-1])
+
+
+def _parse_coordinate(value: Any, lower: float, upper: float) -> Optional[float]:
+    """Parse a finite coordinate within its geographic range."""
+    clean = _clean_str(value)
+    if clean is None:
+        return None
+    try:
+        coordinate = float(clean)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(coordinate) or not lower <= coordinate <= upper:
+        return None
+    return coordinate
 
 
 def _extract_unit_and_value(text: str, is_lower: bool = False) -> Optional[tuple[float, str]]:
@@ -197,7 +237,9 @@ def parse_turnover_slab(slab_str: Optional[str]) -> float:
             return round((cr1 + cr2) / 2.0, 2)
 
     # Fallback: check for single "Above X Cr" or similar
-    above_match = re.search(r"above\s+(?:rs\.?\s*)?(\d+(?:\.\d+)?)\s*(lakhs?|cr(?:ore)?s?)?", s, re.IGNORECASE)
+    above_match = re.search(
+        r"above\s+(?:rs\.?\s*)?(\d+(?:\.\d+)?)\s*(lakhs?|cr(?:ore)?s?)?", s, re.IGNORECASE
+    )
     if above_match:
         val = float(above_match.group(1))
         unit = (above_match.group(2) or "").lower()
@@ -258,9 +300,26 @@ def parse_distributor_row(row: pd.Series) -> Optional[DistributorCandidate]:
         if pincode_match:
             pincode = pincode_match.group(1)
 
+    # Prefer supplied coordinates over any derived geography. The input parser
+    # accepts common header aliases used by operational distributor exports.
+    latitude = _parse_coordinate(
+        _col(row, "LATITUDE", "LAT", "LATITUDE (DECIMAL)", "LATITUDE_DECIMAL"),
+        -90.0,
+        90.0,
+    )
+    longitude = _parse_coordinate(
+        _col(row, "LONGITUDE", "LON", "LNG", "LONGITUDE (DECIMAL)", "LONGITUDE_DECIMAL"),
+        -180.0,
+        180.0,
+    )
+    if latitude is None or longitude is None:
+        latitude = None
+        longitude = None
+
     # Turnover
     turnover_slab = _clean_str(row.get("AGGRE TURNOVER"))
     turnover_midpoint_cr = parse_turnover_slab(turnover_slab)
+    turnover_known = turnover_midpoint_cr > 0.0
 
     # Registration & status
     reg_status = _clean_str(row.get("REGISTRATION STATUS")) or "Unknown"
@@ -333,11 +392,12 @@ def parse_distributor_row(row: pd.Series) -> Optional[DistributorCandidate]:
         state_name=state_name,
         permanent_address=perm_addr,
         pincode=pincode,
-        latitude=None,
-        longitude=None,
-        geocode_source="NONE",
+        latitude=latitude,
+        longitude=longitude,
+        geocode_source=GeoSource.MANUAL if latitude is not None else GeoSource.NONE,
         turnover_slab=turnover_slab,
         turnover_midpoint_cr=turnover_midpoint_cr,
+        turnover_known=turnover_known,
         registration_status=reg_status,
         nature_of_core_business=nature_core,
         constitution=constitution,
@@ -366,14 +426,16 @@ def parse_distributor_row(row: pd.Series) -> Optional[DistributorCandidate]:
 
 def load_distributor_csv(
     csv_path: Path,
-    deduplicate_by_pan: bool = True,
+    deduplicate_by_pan: bool = False,
 ) -> list[DistributorCandidate]:
     """Load distributor CSV and transform into DistributorCandidate models.
 
     Args:
         csv_path: Filesystem path to the input distributor CSV file.
         deduplicate_by_pan: When True, groups GSTINs sharing the same PAN and
-            retains the record with the highest turnover slab midpoint.
+            retains the record with the highest turnover slab midpoint. Pipeline
+            runs keep registrations separate because each can represent a
+            depot-relevant physical site.
 
     Returns:
         List of parsed and deduplicated DistributorCandidate objects.
@@ -402,6 +464,10 @@ def load_distributor_csv(
 
     if df is None:
         raise ValueError(f"Failed to decode CSV {path} with utf-8, latin-1, or cp1252.")
+
+    # GST exports vary in case and incidental whitespace. Canonicalizing the
+    # headers keeps downstream field resolution deterministic.
+    df.columns = [str(column).strip().upper() for column in df.columns]
 
     total_rows = len(df)
     candidates: list[DistributorCandidate] = []

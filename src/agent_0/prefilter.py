@@ -14,8 +14,21 @@ from rich.console import Console
 from rich.table import Table
 
 from agent_0.config import PipelineConfig
-from agent_0.models import DistributorCandidate, PrefilterResult, TataDepot
+from agent_0.csv_loader import is_valid_gstin
+from agent_0.models import (
+    CandidateDisposition,
+    DistributorCandidate,
+    GeoSource,
+    PrefilterResult,
+    TataDepot,
+)
 from agent_0.spatial import check_cannibalization, coarse_road_distance
+
+TRUSTED_SPATIAL_SOURCES = {
+    GeoSource.MANUAL,
+    GeoSource.PIN_EXACT,
+    GeoSource.NOMINATIM,
+}
 
 
 def _evaluate_candidate(
@@ -26,15 +39,14 @@ def _evaluate_candidate(
 ) -> PrefilterResult:
     """Evaluate a single candidate against all hard gates in sequence."""
     rejection_reasons: list[str] = []
+    needs_data_reasons: list[str] = []
     coarse_dist: Optional[float] = None
     nearest_dist: Optional[float] = None
 
     # Gate a: GSTIN validity
     gstin = candidate.gstin.strip() if candidate.gstin else ""
-    if len(gstin) != 15:
-        rejection_reasons.append(
-            f"Invalid GSTIN length ({len(gstin)} != 15): '{candidate.gstin}'"
-        )
+    if not is_valid_gstin(gstin):
+        rejection_reasons.append(f"Invalid GSTIN format or checksum: '{candidate.gstin}'")
 
     # Gate b: Registration status
     status = (candidate.registration_status or "").strip().lower()
@@ -60,30 +72,40 @@ def _evaluate_candidate(
         )
 
     # Gate d: Business activity gate
-    if (
-        candidate.nature_of_core_business is not None
-        and candidate.nature_of_core_business not in config.gates.allowed_business_activities
-    ):
+    core_business = (candidate.nature_of_core_business or "").strip().upper()
+    allowed_activities = {
+        activity.strip().upper() for activity in config.gates.allowed_business_activities
+    }
+    if core_business and core_business not in allowed_activities:
         rejection_reasons.append(
             f"Core business '{candidate.nature_of_core_business}' not in allowed activities "
             f"{config.gates.allowed_business_activities}"
         )
 
     # Gate e: Turnover gate
-    # If turnover_midpoint_cr == 0.0, PASS (unknown / not-disclosed turnover)
-    if candidate.turnover_midpoint_cr != 0.0 and not (
-        config.gates.min_turnover_cr
-        <= candidate.turnover_midpoint_cr
-        <= config.gates.max_turnover_cr
+    if not candidate.turnover_known:
+        needs_data_reasons.append("Turnover is not disclosed or could not be parsed")
+    elif candidate.turnover_midpoint_cr < config.gates.min_turnover_cr:
+        rejection_reasons.append(
+            f"Turnover ₹{candidate.turnover_midpoint_cr:.1f}Cr below minimum "
+            f"{config.gates.min_turnover_cr}Cr"
+        )
+    elif (
+        config.gates.max_turnover_cr is not None
+        and candidate.turnover_midpoint_cr > config.gates.max_turnover_cr
     ):
         rejection_reasons.append(
-            f"Turnover ₹{candidate.turnover_midpoint_cr:.1f}Cr outside allowed range "
-            f"[{config.gates.min_turnover_cr}, {config.gates.max_turnover_cr}]Cr"
+            f"Turnover ₹{candidate.turnover_midpoint_cr:.1f}Cr exceeds configured maximum "
+            f"{config.gates.max_turnover_cr}Cr"
         )
 
     # Gate f: Geocoding check
     if candidate.latitude is None or candidate.longitude is None:
-        rejection_reasons.append("Missing geocoded coordinates (latitude/longitude)")
+        needs_data_reasons.append("Missing geocoded coordinates (latitude/longitude)")
+    elif candidate.geocode_source not in TRUSTED_SPATIAL_SOURCES:
+        needs_data_reasons.append(
+            f"Location requires verification (source: {candidate.geocode_source.value})"
+        )
     else:
         # Gate g: Anti-cannibalization
         too_close, nearest_dist = check_cannibalization(
@@ -112,11 +134,19 @@ def _evaluate_candidate(
                 f"{config.gates.max_coarse_distance_km} km"
             )
 
-    passed = len(rejection_reasons) == 0
+    if rejection_reasons:
+        disposition = CandidateDisposition.REJECTED
+    elif needs_data_reasons:
+        disposition = CandidateDisposition.NEEDS_DATA
+    else:
+        disposition = CandidateDisposition.ELIGIBLE
+
     return PrefilterResult(
         candidate=candidate,
-        passed=passed,
+        disposition=disposition,
+        passed=disposition == CandidateDisposition.ELIGIBLE,
         rejection_reasons=rejection_reasons,
+        needs_data_reasons=needs_data_reasons,
         coarse_road_distance_km=coarse_dist,
         nearest_existing_distributor_km=nearest_dist,
     )
@@ -130,12 +160,13 @@ def _evaluate_candidate(
 # The human-readable reason strings embed variable data (distances, turnover
 # values) which must not fragment the breakdown into one row per candidate.
 REASON_CATEGORIES: list[tuple[str, str]] = [
-    ("Invalid GSTIN length", "GSTIN invalid"),
+    ("Invalid GSTIN format", "GSTIN invalid"),
     ("Registration status not active", "Registration not active"),
     ("Missing steel HSN", "Missing steel HSN / SAC-only"),
     ("Core business", "Core business not allowed"),
-    ("Turnover", "Turnover out of range"),
+    ("Turnover", "Turnover outside policy"),
     ("Missing geocoded coordinates", "Missing coordinates"),
+    ("Location requires verification", "Location needs verification"),
     ("Cannibalization conflict", "Anti-cannibalization conflict"),
     ("Coarse road distance", "Distance exceeds maximum"),
 ]
@@ -156,8 +187,15 @@ def print_prefilter_summary(
     """Print a rich terminal summary of pre-filter results."""
     con = console or Console()
     total = len(results)
-    passed_count = sum(1 for r in results if r.passed)
-    rejected_count = total - passed_count
+    eligible_count = sum(
+        1 for result in results if result.disposition == CandidateDisposition.ELIGIBLE
+    )
+    needs_data_count = sum(
+        1 for result in results if result.disposition == CandidateDisposition.NEEDS_DATA
+    )
+    rejected_count = sum(
+        1 for result in results if result.disposition == CandidateDisposition.REJECTED
+    )
 
     summary_table = Table(title="Pre-Filter Stage Summary", show_header=True)
     summary_table.add_column("Metric", style="bold cyan")
@@ -165,16 +203,28 @@ def print_prefilter_summary(
     summary_table.add_column("Percentage", justify="right")
 
     summary_table.add_row("Total Evaluated", str(total), "100.0%")
-    pct_pass = (passed_count / total * 100.0) if total > 0 else 0.0
+    pct_eligible = (eligible_count / total * 100.0) if total > 0 else 0.0
+    pct_needs_data = (needs_data_count / total * 100.0) if total > 0 else 0.0
     pct_fail = (rejected_count / total * 100.0) if total > 0 else 0.0
-    summary_table.add_row("Passed", f"[green]{passed_count}[/green]", f"{pct_pass:.1f}%")
+    summary_table.add_row(
+        "Eligible",
+        f"[green]{eligible_count}[/green]",
+        f"{pct_eligible:.1f}%",
+    )
+    summary_table.add_row(
+        "Needs Data",
+        f"[yellow]{needs_data_count}[/yellow]",
+        f"{pct_needs_data:.1f}%",
+    )
     summary_table.add_row("Rejected", f"[red]{rejected_count}[/red]", f"{pct_fail:.1f}%")
     con.print(summary_table)
 
-    if rejected_count > 0:
+    if rejected_count > 0 or needs_data_count > 0:
         reason_counts: Counter[str] = Counter()
         for r in results:
             for reason in r.rejection_reasons:
+                reason_counts[categorise_rejection(reason)] += 1
+            for reason in r.needs_data_reasons:
                 reason_counts[categorise_rejection(reason)] += 1
 
         reason_table = Table(title="Rejection Reasons Breakdown", show_header=True)
@@ -202,7 +252,8 @@ def prefilter(
         config: Pipeline configuration containing gate thresholds.
 
     Returns:
-        List of PrefilterResult objects, with passed candidates sorted first.
+        List of PrefilterResult objects, with eligible candidates first,
+        followed by Needs Data and rejected records.
     """
     evaluated: list[PrefilterResult] = [
         _evaluate_candidate(
@@ -216,6 +267,13 @@ def prefilter(
 
     print_prefilter_summary(evaluated)
 
-    passed_results = [r for r in evaluated if r.passed]
-    failed_results = [r for r in evaluated if not r.passed]
-    return passed_results + failed_results
+    eligible_results = [
+        result for result in evaluated if result.disposition == CandidateDisposition.ELIGIBLE
+    ]
+    needs_data_results = [
+        result for result in evaluated if result.disposition == CandidateDisposition.NEEDS_DATA
+    ]
+    rejected_results = [
+        result for result in evaluated if result.disposition == CandidateDisposition.REJECTED
+    ]
+    return eligible_results + needs_data_results + rejected_results

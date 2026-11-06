@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-0"
-version = "0.1.0"
-description = "Agent 0 — Tata Steel GTM Distributor Search & Scoring Engine"
+version = "0.2.0"
+description = "Agent 0 — Tata Steel distributor discovery and evidence verification"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

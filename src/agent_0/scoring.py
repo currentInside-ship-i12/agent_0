@@ -13,7 +13,9 @@ from agent_0.config import PipelineConfig
 from agent_0.models import (
     DistributorCandidate,
     EnrichmentSource,
+    EvidenceValidation,
     FinalEvaluation,
+    RecommendationState,
     S2TVerificationOutput,
     ScoreBreakdown,
 )
@@ -33,23 +35,20 @@ def _compute_profit_score(
     else:
         s_logistics = 0.0
 
-    # 2. Turnover score (smooth bell curve on midpoint in ₹ Crores).
+    # 2. Turnover score. All distributors above the established target band
+    # remain eligible at the same score; market-coverage strategy deliberately
+    # lives outside this deterministic lead-quality score.
     # Continuous ramps — no cliff at 15 Cr:
     #   0 -> 15 Cr   : 0 -> 25
     #   15 -> 50 Cr  : 25 -> 100
-    #   50 -> 150 Cr : 100 (plateau)
-    #   150 -> 300 Cr: 100 -> 50 (taper, floored at 40)
+    #   50+ Cr        : 100 (plateau)
     turnover = max(0.0, candidate.turnover_midpoint_cr)
     if 0.0 <= turnover < 15.0:
         s_turnover = 25.0 * (turnover / 15.0) if turnover > 0.0 else 0.0
     elif 15.0 <= turnover < 50.0:
         s_turnover = 25.0 + 75.0 * ((turnover - 15.0) / 35.0)
-    elif 50.0 <= turnover <= 150.0:
-        s_turnover = 100.0
-    elif 150.0 < turnover <= 300.0:
-        s_turnover = max(40.0, 100.0 - (turnover - 150.0) / 3.0)
     else:
-        s_turnover = 0.0
+        s_turnover = 100.0
 
     # 3. Processing capability score
     proc_map: dict[str, float] = {
@@ -61,11 +60,7 @@ def _compute_profit_score(
 
     # Weighted combination
     w = config.profit_weights
-    profit_score = (
-        w.logistics * s_logistics
-        + w.turnover * s_turnover
-        + w.processing * s_processing
-    )
+    profit_score = w.logistics * s_logistics + w.turnover * s_turnover + w.processing * s_processing
 
     return s_logistics, s_turnover, s_processing, profit_score
 
@@ -116,9 +111,7 @@ def _compute_ease_score(
     # Weighted combination
     u = config.ease_weights
     ease_score = (
-        u.compliance * e_compliance
-        + u.switching * e_switching
-        + u.infrastructure * e_infra
+        u.compliance * e_compliance + u.switching * e_switching + u.infrastructure * e_infra
     )
 
     return e_compliance, e_switching, e_infra, ease_score
@@ -126,15 +119,15 @@ def _compute_ease_score(
 
 def _verification_status(
     s2t: S2TVerificationOutput,
-    enrichment_source: EnrichmentSource,
+    evidence_validation: EvidenceValidation,
 ) -> Literal["VERIFIED", "PARTIAL", "UNVERIFIED", "FAILED"]:
     if s2t.verbatim_evidence.startswith("LLM call failed"):
         return "FAILED"
-    if s2t.evidence_confidence == "NONE":
-        return "UNVERIFIED"
-    if enrichment_source != EnrichmentSource.FIRECRAWL:
+    if evidence_validation.verified:
+        return "VERIFIED"
+    if evidence_validation.valid_citation_count > 0:
         return "PARTIAL"
-    return "VERIFIED"
+    return "UNVERIFIED"
 
 
 def score_candidate(
@@ -145,6 +138,8 @@ def score_candidate(
     config: PipelineConfig,
     enrichment_source: EnrichmentSource = EnrichmentSource.NONE,
     verification_provider: Optional[str] = None,
+    verification_model: Optional[str] = None,
+    evidence_validation: Optional[EvidenceValidation] = None,
 ) -> FinalEvaluation:
     """Evaluate and grade a single distributor candidate.
 
@@ -156,6 +151,8 @@ def score_candidate(
         config: Pipeline configuration with weights and grading thresholds.
         enrichment_source: Source used for evidence enrichment.
         verification_provider: LLM provider that served the verification.
+        verification_model: Concrete provider model that served verification.
+        evidence_validation: Deterministic citation-validation result.
 
     Returns:
         FinalEvaluation with complete breakdown and letter grade.
@@ -183,24 +180,28 @@ def score_candidate(
         ease_score=round(ease_score, 2),
     )
 
+    evidence_validation = evidence_validation or EvidenceValidation()
+
     # Deterministic grading
     g = config.grading
     rejection_reasons: list[str] = []
+    hard_disqualified = False
 
     if not s2t.is_primary_steel_dealer:
         rejection_reasons.append("Entity is not a primary steel dealer")
+        hard_disqualified = True
 
     if s2t.gst_filing_regularity == "CANCELLED":
         rejection_reasons.append("GST filing regularity is CANCELLED (compliance hard fail)")
+        hard_disqualified = True
 
     confidence = s2t.confidence_score
 
+    if hard_disqualified:
+        final_grade: Literal["A", "B", "C", "D"] = "D"
     # Enforce Grade D ceiling: critically low profit AND ease can never
     # grade above D, regardless of other signals.
-    if (
-        profit_score <= g.grade_d_max_profit
-        and ease_score <= g.grade_d_max_ease
-    ):
+    elif profit_score <= g.grade_d_max_profit and ease_score <= g.grade_d_max_ease:
         final_grade: Literal["A", "B", "C", "D"] = "D"
         rejection_reasons.append(
             f"Critically low scores: profit {profit_score:.1f} <= {g.grade_d_max_profit} "
@@ -219,10 +220,7 @@ def score_candidate(
         and s2t.is_primary_steel_dealer
     ):
         final_grade = "B"
-    elif (
-        profit_score >= g.grade_c_min_profit
-        and s2t.is_primary_steel_dealer
-    ):
+    elif profit_score >= g.grade_c_min_profit and s2t.is_primary_steel_dealer:
         final_grade = "C"
     else:
         final_grade = "D"
@@ -231,11 +229,24 @@ def score_candidate(
                 f"Below Grade C profit threshold: {profit_score:.1f} < {g.grade_c_min_profit}"
             )
 
-    verification_status = _verification_status(s2t, enrichment_source)
-    unverified = s2t.evidence_confidence == "NONE"
-    if unverified and final_grade in ("A", "B"):
+    verification_status = _verification_status(s2t, evidence_validation)
+    if verification_status != "VERIFIED" and final_grade in ("A", "B"):
         final_grade = "C"
-        rejection_reasons.append("Unverified (no LLM evidence) — grade capped at C")
+        rejection_reasons.append("Evidence is not citation-validated — grade capped at C")
+
+    if hard_disqualified:
+        recommendation_state = RecommendationState.REJECTED
+        action = "Rejected — resolve the hard disqualifier before reconsidering"
+    elif final_grade in ("A", "B") and verification_status == "VERIFIED":
+        recommendation_state = RecommendationState.VERIFIED_RECOMMENDATION
+        action = (
+            "Immediate commercial dispatch"
+            if final_grade == "A"
+            else "Prioritized commercial outreach"
+        )
+    else:
+        recommendation_state = RecommendationState.PRIORITIZED_LEAD
+        action = "Field verification or evidence collection required"
 
     return FinalEvaluation(
         gstin=candidate.gstin,
@@ -251,7 +262,11 @@ def score_candidate(
         verification=s2t,
         enrichment_source=enrichment_source,
         verification_provider=verification_provider,
+        verification_model=verification_model,
         verification_status=verification_status,
+        evidence_validation=evidence_validation,
+        recommendation_state=recommendation_state,
+        action=action,
         rejection_reasons=rejection_reasons,
         turnover_slab=candidate.turnover_slab,
         permanent_address=candidate.permanent_address,
